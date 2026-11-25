@@ -72,6 +72,7 @@ def _channel(text: str):
 def test_enqueue_frame_returns_true_when_appended():
     server = _server()
     server._write_queue = asyncio.Queue(maxsize=8)
+    server._client_writer = _OpenWriter()
     assert server._enqueue_frame(b"\x01\x02\x03") is True
     raw = server._write_queue.get_nowait()
     assert raw == bytes([FRAME_OUTBOUND_PREFIX]) + struct.pack("<H", 3) + b"\x01\x02\x03"
@@ -86,6 +87,7 @@ def test_enqueue_frame_returns_false_without_client():
 def test_enqueue_frame_returns_false_on_oversize_payload():
     server = _server()
     server._write_queue = asyncio.Queue(maxsize=8)
+    server._client_writer = _OpenWriter()
     assert server._enqueue_frame(bytes(MAX_PAYLOAD_SIZE + 1)) is False
     assert server._write_queue.empty()
 
@@ -93,6 +95,7 @@ def test_enqueue_frame_returns_false_on_oversize_payload():
 def test_enqueue_frame_returns_false_when_queue_full():
     server = _server()
     server._write_queue = asyncio.Queue(maxsize=1)
+    server._client_writer = _OpenWriter()
     assert server._enqueue_frame(b"\x01") is True
     assert server._enqueue_frame(b"\x02") is False
     assert server._write_queue.qsize() == 1
@@ -101,6 +104,7 @@ def test_enqueue_frame_returns_false_when_queue_full():
 def test_write_frame_returns_enqueue_result():
     server = _server()
     server._write_queue = asyncio.Queue(maxsize=1)
+    server._client_writer = _OpenWriter()
     assert server._write_frame(b"\x01") is True
     assert server._write_frame(b"\x02") is False
 
@@ -190,3 +194,22 @@ def test_build_message_frame_oversize_signed_frame_still_fits_with_author():
     assert len(frame) <= MAX_PAYLOAD_SIZE
     # V1 header: code(1) prefix(6) path_len(1) txt_type(1) ts(4) author(4)
     assert frame[13:17] == b"\x01\x02\x03\x04"
+
+
+class _OpenWriter:
+    """A live attached-transport double for tests that stub the write queue."""
+
+    def write(self, _data):
+        return None
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+    def is_closing(self):
+        return False

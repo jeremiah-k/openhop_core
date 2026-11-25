@@ -168,6 +168,7 @@ async def test_node_discovered_pushes_new_advert_when_auto_add_filtered():
 
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=256)
+    server._client_writer = _OpenWriter()
     server._setup_push_callbacks()
 
     peer = LocalIdentity()
@@ -212,6 +213,7 @@ async def test_node_discovered_pushes_short_advert_for_stored_contact():
 
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=256)
+    server._client_writer = _OpenWriter()
     server._setup_push_callbacks()
 
     peer = LocalIdentity()
@@ -251,6 +253,7 @@ async def test_self_advert_pushes_no_frame_to_client():
 
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=256)
+    server._client_writer = _OpenWriter()
     server._setup_push_callbacks()
 
     await bridge.process_received_packet(PacketBuilder.create_advert(identity, "Me"))
@@ -671,6 +674,7 @@ async def test_push_trace_data_enqueues_frame():
     bridge = _MockBridgeSendRawDirect()
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=256)
+    server._client_writer = _OpenWriter()
 
     server.push_trace_data(
         path_len=1,
@@ -695,6 +699,7 @@ async def test_push_rx_raw_enqueues_frame():
     bridge = _MockBridgeSendRawDirect()
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=256)
+    server._client_writer = _OpenWriter()
 
     server.push_rx_raw(snr=-5.0, rssi=-100, raw=b"abc")
     assert not server._write_queue.empty()
@@ -709,6 +714,7 @@ async def test_push_burst_all_enqueued():
     bridge = _MockBridgeSendRawDirect()
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=256)
+    server._client_writer = _OpenWriter()
 
     for i in range(5):
         server.push_rx_raw(snr=0.0, rssi=-80, raw=bytes([i]))
@@ -720,6 +726,7 @@ def test_push_rx_raw_sync_enqueues_immediately():
     bridge = _MockBridgeSendRawDirect()
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=256)
+    server._client_writer = _OpenWriter()
 
     server.push_rx_raw(snr=-5.0, rssi=-100, raw=b"abc")
     assert server._write_queue.qsize() == 1
@@ -730,6 +737,7 @@ def test_push_trace_data_sync_enqueues_immediately():
     bridge = _MockBridgeSendRawDirect()
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=256)
+    server._client_writer = _OpenWriter()
 
     server.push_trace_data(
         path_len=1,
@@ -750,6 +758,7 @@ async def test_writer_loop_writes_and_drains():
     bridge.get_time = Mock(return_value=12345)
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=256)
+    server._client_writer = _OpenWriter()
 
     writer = Mock()
     writer.write = Mock()
@@ -1649,6 +1658,7 @@ def test_binary_response_push_only_for_owned_tag():
     bridge = Mock()
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=16)
+    server._client_writer = _OpenWriter()
     server._setup_push_callbacks()
 
     # Take the handler the server actually subscribed for this event, so the
@@ -1691,6 +1701,7 @@ def _path_discovery_server():
     bridge = Mock()
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=16)
+    server._client_writer = _OpenWriter()
     return server
 
 
@@ -1894,6 +1905,7 @@ async def test_cmd_send_txt_msg_threads_host_timestamp():
 
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=256)
+    server._client_writer = _OpenWriter()
 
     host_ts = 1700000000
     # data: txt_type(1) + attempt(1) + msg_timestamp(4, LE) + pubkey_prefix(6) + text
@@ -1934,6 +1946,7 @@ async def test_cmd_send_txt_msg_zero_host_timestamp_mints_fresh():
 
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=256)
+    server._client_writer = _OpenWriter()
 
     data = bytes([TXT_TYPE_PLAIN, 0]) + struct.pack("<I", 0) + pubkey[:6] + b"hi"
     await server._cmd_send_txt_msg(data)
@@ -1949,6 +1962,7 @@ def _make_capture_server(bridge, **kwargs):
     """Server whose outbound frames (responses and errors) land in a list."""
     server = CompanionFrameServer(bridge, "hash", port=0, **kwargs)
     frames: list[bytes] = []
+
     def capture(frame):
         frames.append(frame)
         return True
@@ -3025,6 +3039,7 @@ async def test_cmd_get_stats_uses_stats_getter():
 def test_enqueue_frame_header_format():
     server = CompanionFrameServer(Mock(), "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=8)
+    server._client_writer = _OpenWriter()
     server._enqueue_frame(b"\x01\x02\x03")
     raw = server._write_queue.get_nowait()
     assert raw == bytes([FRAME_OUTBOUND_PREFIX]) + struct.pack("<H", 3) + b"\x01\x02\x03"
@@ -3036,6 +3051,7 @@ def test_send_confirmed_push_includes_trip_time():
 
     server = CompanionFrameServer(Mock(), "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=8)
+    server._client_writer = _OpenWriter()
     server._on_send_confirmed(0xAABBCCDD, 1234)
     raw = server._write_queue.get_nowait()
     payload = raw[3:]  # strip FRAME_OUTBOUND_PREFIX + uint16 length
@@ -3044,9 +3060,30 @@ def test_send_confirmed_push_includes_trip_time():
     assert struct.unpack("<I", payload[5:9])[0] == 1234
 
 
+class _OpenWriter:
+    """A live attached-transport double for enqueue-level unit tests."""
+
+    def write(self, _data):
+        return None
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+    def is_closing(self):
+        return False
+
+
 def test_enqueue_frame_drops_oversize_payload():
     server = CompanionFrameServer(Mock(), "hash", port=0)
+    server._client_writer = _OpenWriter()
     server._write_queue = asyncio.Queue(maxsize=8)
+    server._client_writer = _OpenWriter()
     # Firmware writeFrame refuses an over-size frame; we drop rather than
     # truncate (a truncated frame would corrupt the response).
     server._enqueue_frame(bytes(MAX_PAYLOAD_SIZE + 1))
@@ -3055,7 +3092,9 @@ def test_enqueue_frame_drops_oversize_payload():
 
 def test_enqueue_frame_allows_max_payload():
     server = CompanionFrameServer(Mock(), "hash", port=0)
+    server._client_writer = _OpenWriter()
     server._write_queue = asyncio.Queue(maxsize=8)
+    server._client_writer = _OpenWriter()
     server._enqueue_frame(bytes(MAX_PAYLOAD_SIZE))
     raw = server._write_queue.get_nowait()
     assert struct.unpack("<H", raw[1:3])[0] == MAX_PAYLOAD_SIZE
@@ -3063,12 +3102,47 @@ def test_enqueue_frame_allows_max_payload():
 
 def test_enqueue_frame_no_queue_and_queue_full_are_safe():
     server = CompanionFrameServer(Mock(), "hash", port=0)
+    server._client_writer = _OpenWriter()
     server._write_queue = None
     server._enqueue_frame(b"\x01")  # must not raise
 
     server._write_queue = asyncio.Queue(maxsize=1)
+
+    server._client_writer = _OpenWriter()
     server._enqueue_frame(b"\x01")
     server._enqueue_frame(b"\x02")  # dropped, must not raise
+    assert server._write_queue.qsize() == 1
+
+
+def test_enqueue_frame_refuses_a_closed_or_closing_transport():
+    """No frame may be admitted into a transport that already died.
+
+    The killed-client mid-drain shape: the socket is dead while the server
+    still has the client attached and its write queue in place. Admission
+    into that queue would lose the frame together with the dying client, so
+    callers that retire durable state on a ``True`` return must see a
+    refusal instead.
+    """
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+
+    class _ClosingWriter(_OpenWriter):
+        def __init__(self):
+            self.closed = False
+
+        def is_closing(self):
+            return self.closed
+
+    writer = _ClosingWriter()
+    server._client_writer = writer
+    server._write_queue = asyncio.Queue(maxsize=8)
+    assert server._enqueue_frame(b"\x01") is True
+
+    writer.closed = True  # socket dead, disconnect not yet processed
+    assert server._enqueue_frame(b"\x02") is False
+    assert server._write_queue.qsize() == 1
+
+    server._client_writer = None  # torn down between writer and queue
+    assert server._enqueue_frame(b"\x03") is False
     assert server._write_queue.qsize() == 1
 
 

@@ -50,7 +50,9 @@ def test_stale_command_does_not_write_to_replacement_or_block_other_companion():
     other = CompanionFrameServer(SimpleNamespace(), "02")
     old = asyncio.Queue()
     server._write_queue = asyncio.Queue()
+    server._client_writer = _OpenWriter()
     other._write_queue = asyncio.Queue()
+    other._client_writer = _OpenWriter()
     token = _command_queue.set((server, old))
     try:
         assert not server._enqueue_frame(b"old response")
@@ -59,3 +61,22 @@ def test_stale_command_does_not_write_to_replacement_or_block_other_companion():
     finally:
         _command_queue.reset(token)
     assert server._enqueue_frame(b"current push")
+
+
+class _OpenWriter:
+    """A live attached-transport double for tests that stub the write queue."""
+
+    def write(self, _data):
+        return None
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+    def is_closing(self):
+        return False

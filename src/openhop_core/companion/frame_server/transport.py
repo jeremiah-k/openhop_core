@@ -132,6 +132,15 @@ class _FrameTransportMixin:
         if self._write_queue is None:
             logger.debug("No client attached; dropping outbound frame")
             return False
+        writer = getattr(self, "_client_writer", None)
+        if writer is None or writer.is_closing():
+            # The socket is already dead (or tearing down) while the server has
+            # not processed the disconnect yet — exactly the killed-client
+            # mid-drain shape. A frame admitted here dies with the client's
+            # write queue, so callers that retire durable state on the strength
+            # of a ``True`` return would lose the message. Refuse instead.
+            logger.debug("Client transport closed or closing; refusing outbound frame")
+            return False
         if len(data) > MAX_PAYLOAD_SIZE:
             # Firmware writeFrame() refuses (returns 0) rather than truncating; a
             # truncated frame would corrupt the response. Drop it instead.
