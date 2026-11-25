@@ -1949,7 +1949,11 @@ def _make_capture_server(bridge, **kwargs):
     """Server whose outbound frames (responses and errors) land in a list."""
     server = CompanionFrameServer(bridge, "hash", port=0, **kwargs)
     frames: list[bytes] = []
-    server._write_frame = lambda f: frames.append(f)
+    def capture(frame):
+        frames.append(frame)
+        return True
+
+    server._write_frame = capture
     return server, frames
 
 

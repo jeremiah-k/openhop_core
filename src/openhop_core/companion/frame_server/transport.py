@@ -6,6 +6,7 @@ import logging
 import socket
 import struct
 import sys
+from contextvars import ContextVar
 from typing import Optional
 
 from ..constants import (
@@ -23,6 +24,12 @@ from ..models import SentResult
 
 logger = logging.getLogger("CompanionFrameServer")
 
+# A command may suspend while its client is replaced. Responses must never
+# be redirected to the successor; unsolicited pushes have no command owner.
+_command_queue: ContextVar[Optional[tuple[object, Optional[asyncio.Queue]]]] = ContextVar(
+    "companion_command_queue", default=None
+)
+
 
 class _FrameTransportMixin:
     """TCP lifecycle and frame I/O methods of :class:`CompanionFrameServer`."""
@@ -33,6 +40,8 @@ class _FrameTransportMixin:
 
     async def start(self) -> None:
         """Start the TCP server."""
+        # Symmetric with stop(): a restarted server accepts clients again.
+        self._closing = False
         self._server = await asyncio.start_server(
             self._handle_client,
             self.bind_address,
@@ -57,28 +66,40 @@ class _FrameTransportMixin:
 
     async def stop(self) -> None:
         """Stop the TCP server and disconnect any client."""
-        # Signal writer task to stop and wait for it
-        if self._write_queue is not None:
-            try:
-                self._write_queue.put_nowait(None)  # Sentinel
-            except asyncio.QueueFull:
-                pass
-        if self._writer_task is not None:
-            self._writer_task.cancel()
-            try:
-                await self._writer_task
-            except asyncio.CancelledError:
-                pass
-            self._writer_task = None
-        self._write_queue = None
-        if self._client_writer:
-            try:
-                self._client_writer.close()
-                await self._client_writer.wait_closed()
-            except Exception:
-                pass
-            self._client_writer = None
-            self._client_reader = None
+        # Retire admission before awaiting any client cleanup.
+        if self._server:
+            self._server.close()
+        # Settle the per-client registration under the attach lock: a handler
+        # that acquired the lock just before this call has finished attaching
+        # and is torn down here, and once shutdown has begun no newly accepted
+        # client can attach while this teardown runs (they wait on the lock and
+        # are refused below).
+        async with self._client_attach_lock:
+            self._closing = True
+            queue, self._write_queue = self._write_queue, None
+            if queue is not None:
+                try:
+                    queue.put_nowait(None)  # Sentinel
+                except asyncio.QueueFull:
+                    pass
+            if self._writer_task is not None:
+                self._writer_task.cancel()
+                try:
+                    await self._writer_task
+                except asyncio.CancelledError:
+                    pass
+                self._writer_task = None
+            self._write_queue = None
+            if self._client_writer:
+                try:
+                    self._client_writer.close()
+                    await self._client_writer.wait_closed()
+                except Exception:
+                    pass
+                self._client_writer = None
+                self._client_reader = None
+        # The listener wait stays outside the lock so handlers already queued
+        # on it can drain and exit instead of deadlocking the close.
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -105,6 +126,9 @@ class _FrameTransportMixin:
         where dropping the frame means losing the message — have to check the
         result and keep the message for a later attempt.
         """
+        owner = _command_queue.get()
+        if owner is not None and owner[0] is self and owner[1] is not self._write_queue:
+            return False
         if self._write_queue is None:
             logger.debug("No client attached; dropping outbound frame")
             return False
@@ -185,13 +209,16 @@ class _FrameTransportMixin:
         On any write/drain error the writer is closed, which causes the read
         loop in :pymethod:`_handle_client` to receive EOF → clean disconnect.
         """
+        queue = self._write_queue
+        if queue is None:
+            return
         frames_since_drain = 0
         try:
             while True:
                 # Wait for a frame, or timeout for heartbeat ---------
                 try:
                     frame = await asyncio.wait_for(
-                        self._write_queue.get(),
+                        queue.get(),
                         timeout=self._heartbeat_interval,
                     )
                 except asyncio.TimeoutError:
@@ -210,7 +237,7 @@ class _FrameTransportMixin:
                 frames_since_drain += 1
 
                 # Drain when queue empties (natural batching) or every N frames
-                if self._write_queue.empty() or frames_since_drain >= self._DRAIN_BATCH:
+                if queue.empty() or frames_since_drain >= self._DRAIN_BATCH:
                     await writer.drain()
                     frames_since_drain = 0
         except asyncio.CancelledError:
@@ -269,6 +296,8 @@ class _FrameTransportMixin:
         )
         old_writer = self._client_writer
         old_writer_task = self._writer_task
+        self._write_queue = None
+        self._writer_task = None
         # Cancel and await the old writer task so it's fully gone before we replace
         # the queue and create a new task (avoids the new task being mistaken for
         # a failed writer when the old task had already exited).
@@ -308,7 +337,15 @@ class _FrameTransportMixin:
                 logger.warning("Frame too long: %s", frame_len)
                 return "frame_too_long"
             payload = await reader.readexactly(frame_len)
-            await self._handle_cmd(payload)
+            # A replaced client must not dispatch a buffered command into
+            # its successor's outbound queue.
+            if writer_task is not self._writer_task:
+                return "client_replaced"
+            token = _command_queue.set((self, self._write_queue))
+            try:
+                await self._handle_cmd(payload)
+            finally:
+                _command_queue.reset(token)
             if writer_task.done():
                 if not writer_task.cancelled():
                     exc = writer_task.exception()
@@ -329,19 +366,31 @@ class _FrameTransportMixin:
         and the new one is accepted (eviction). An idle read timeout also
         frees the slot when no data is received for client_idle_timeout_sec.
         """
-        if self._client_writer:
-            await self._evict_existing_client()
+        async with self._client_attach_lock:
+            if self._closing:
+                # Shutdown has begun: this handler belongs to a connection the
+                # listener accepted before it retired. Close the socket cleanly
+                # instead of starting a client on a server that is going away.
+                logger.info("Companion client refused during shutdown (port=%s)", self.port)
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return
+            if self._client_writer:
+                await self._evict_existing_client()
 
-        self._client_reader = reader
-        self._client_writer = writer
-        self._configure_socket(writer)
-        local_write_queue: asyncio.Queue = asyncio.Queue(maxsize=self._WRITE_QUEUE_MAXSIZE)
-        self._write_queue = local_write_queue
-        self._setup_push_callbacks()
-        logger.info("Companion client connected (port=%s)", self.port)
+            self._client_reader = reader
+            self._client_writer = writer
+            self._configure_socket(writer)
+            local_write_queue: asyncio.Queue = asyncio.Queue(maxsize=self._WRITE_QUEUE_MAXSIZE)
+            self._write_queue = local_write_queue
+            self._setup_push_callbacks()
+            logger.info("Companion client connected (port=%s)", self.port)
 
-        local_writer_task = asyncio.create_task(self._writer_loop(writer))
-        self._writer_task = local_writer_task
+            local_writer_task = asyncio.create_task(self._writer_loop(writer))
+            self._writer_task = local_writer_task
         disconnect_reason: Optional[str] = None
         try:
             disconnect_reason = await self._read_client_frames(reader, local_writer_task)
@@ -366,6 +415,7 @@ class _FrameTransportMixin:
     ) -> None:
         """Tear down per-client state, skipping parts a new client already replaced."""
         if self._write_queue is write_queue:
+            self._write_queue = None
             try:
                 write_queue.put_nowait(None)  # Sentinel
             except asyncio.QueueFull:
@@ -376,12 +426,12 @@ class _FrameTransportMixin:
                 self.port,
             )
         if self._writer_task is writer_task:
+            self._writer_task = None
             writer_task.cancel()
             try:
                 await writer_task
             except asyncio.CancelledError:
                 pass
-            self._writer_task = None
         else:
             logger.debug(
                 "Skipping stale writer cleanup for disconnected client (port=%s)",

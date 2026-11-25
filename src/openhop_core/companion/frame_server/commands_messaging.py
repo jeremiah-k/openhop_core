@@ -423,16 +423,36 @@ class _MessagingCommandsMixin:
         header += extra
         return header + _truncate_utf8(msg.text, MAX_PAYLOAD_SIZE - len(header))
 
-    async def _cmd_sync_next_message(self, data: bytes) -> None:
+    def _sync_memory_message(self) -> bool:
+        """Handle one memory entry; False means only that the queue was empty.
+
+        No await separates pop, frame admission and rollback. A failed enqueue
+        restores the original FIFO head without evicting another message.
+        """
         msg = self.bridge.sync_next_message()
         if msg is None:
-            persisted = await asyncio.to_thread(self._sync_next_from_persistence)
-            if persisted is None:
-                self._write_frame(bytes([RESP_CODE_NO_MORE_MESSAGES]))
-                return
-            # A durable store hands back the row id with the message; the
-            # owning subclass deletes the row itself once the frame is queued.
-            msg = persisted[1] if isinstance(persisted, tuple) else persisted
+            return False
+        accepted = False
+        try:
+            accepted = self._write_frame(self._build_message_frame(msg))
+            if accepted:
+                msg.frame_enqueued = True
+        finally:
+            if not accepted:
+                self.bridge.message_queue.restore_front(msg)
+        return True
+
+    async def _cmd_sync_next_message(self, data: bytes) -> None:
+        if self._sync_memory_message():
+            return
+        queue = self._write_queue
+        persisted = await asyncio.to_thread(self._sync_next_from_persistence)
+        if self._write_queue is not queue:
+            return
+        if persisted is None:
+            self._write_frame(bytes([RESP_CODE_NO_MORE_MESSAGES]))
+            return
+        msg = persisted[1] if isinstance(persisted, tuple) else persisted
         self._write_frame(self._build_message_frame(msg))
 
     async def _cmd_send_login(self, data: bytes) -> None:

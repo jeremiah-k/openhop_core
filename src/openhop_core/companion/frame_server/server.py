@@ -143,6 +143,10 @@ class CompanionFrameServer(
         self._client_reader: Optional[asyncio.StreamReader] = None
         self._write_queue: Optional[asyncio.Queue] = None
         self._writer_task: Optional[asyncio.Task] = None
+        self._client_attach_lock = asyncio.Lock()
+        # Set by stop() under the attach lock: once shutdown has begun, no
+        # newly accepted client may start a handler on the closing server.
+        self._closing = False
         self._app_target_ver = 0
 
         # Pre-compute padded device info bytes for _cmd_device_query. Version string
