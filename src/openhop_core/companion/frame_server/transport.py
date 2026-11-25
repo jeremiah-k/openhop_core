@@ -89,14 +89,25 @@ class _FrameTransportMixin:
         self._teardown_push_callbacks()
         logger.info("Companion frame server stopped (port=%s)", self.port)
 
-    def _enqueue_frame(self, data: bytes) -> None:
+    def _enqueue_frame(self, data: bytes) -> bool:
         """Build an outbound frame and enqueue it for the writer task.
 
-        Sync, non-blocking.  On ``QueueFull`` the frame is dropped with a
-        warning — this provides natural backpressure shedding.
+        Sync, non-blocking.  Returns ``True`` only when the frame was actually
+        appended to the write queue.  ``False`` means the frame did *not* reach
+        the client:
+
+        * no client is attached (the write queue does not exist),
+        * the payload exceeds ``MAX_PAYLOAD_SIZE`` (firmware ``writeFrame()``
+          refuses it), or
+        * the write queue is full (backpressure shedding).
+
+        Callers that must not lose a frame — e.g. the persisted message queue,
+        where dropping the frame means losing the message — have to check the
+        result and keep the message for a later attempt.
         """
         if self._write_queue is None:
-            return
+            logger.debug("No client attached; dropping outbound frame")
+            return False
         if len(data) > MAX_PAYLOAD_SIZE:
             # Firmware writeFrame() refuses (returns 0) rather than truncating; a
             # truncated frame would corrupt the response. Drop it instead.
@@ -105,16 +116,21 @@ class _FrameTransportMixin:
                 len(data),
                 MAX_PAYLOAD_SIZE,
             )
-            return
+            return False
         frame = bytes([FRAME_OUTBOUND_PREFIX]) + struct.pack("<H", len(data)) + data
         try:
             self._write_queue.put_nowait(frame)
         except asyncio.QueueFull:
             logger.warning("Write queue full (%s); dropping frame", self._write_queue.maxsize)
+            return False
+        return True
 
-    def _write_frame(self, data: bytes) -> None:
-        """Alias for ``_enqueue_frame``; retained for subclass compatibility."""
-        self._enqueue_frame(data)
+    def _write_frame(self, data: bytes) -> bool:
+        """Alias for ``_enqueue_frame``; retained for subclass compatibility.
+
+        Returns the same "was it queued?" result as :meth:`_enqueue_frame`.
+        """
+        return self._enqueue_frame(data)
 
     def _write_ok(self) -> None:
         self._write_frame(bytes([RESP_CODE_OK]))
