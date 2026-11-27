@@ -144,8 +144,9 @@ class CompanionFrameServer(
         self._write_queue: Optional[asyncio.Queue] = None
         self._writer_task: Optional[asyncio.Task] = None
         self._client_attach_lock = asyncio.Lock()
-        # Set by stop() under the attach lock: once shutdown has begun, no
-        # newly accepted client may start a handler on the closing server.
+        # Set by stop() before it touches the listener or waits for the attach
+        # lock: once shutdown has begun, no client may start a handler on the
+        # closing server.
         self._closing = False
         self._app_target_ver = 0
 

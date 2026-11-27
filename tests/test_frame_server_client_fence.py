@@ -9,6 +9,7 @@ queue and is delivered to B instead.
 from __future__ import annotations
 
 import asyncio
+import logging
 import struct
 from collections import deque
 from unittest.mock import Mock
@@ -84,6 +85,22 @@ class _RecordingWriter:
 
     def is_closing(self) -> bool:
         return self.closed
+
+
+class _GatedWriter(_RecordingWriter):
+    """Writer double whose ``wait_closed()`` stalls until released.
+
+    An attach that is evicting this writer's client therefore stays suspended
+    inside its attach section, holding the attach lock, until the test releases
+    the gate — a deterministic stand-in for the eviction's real awaits.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.release_wait_closed = asyncio.Event()
+
+    async def wait_closed(self) -> None:
+        await self.release_wait_closed.wait()
 
 
 async def _wait_until(condition, spins: int = 500) -> None:
@@ -236,6 +253,111 @@ async def test_shutdown_and_a_new_client_settle_in_attach_order():
     reader_a.close()
     await _wait_until(lambda: handler_a.done())
     await asyncio.gather(handler_a)
+
+
+@pytest.mark.asyncio
+async def test_a_handler_queued_ahead_of_stop_is_refused(caplog):
+    """A handler queued on the attach lock before stop() is still refused.
+
+    asyncio locks are fair: a handler that began waiting on the attach lock
+    before stop() was called acquires it ahead of stop() itself. Because
+    stop() retires admission before it queues on the lock, that handler finds
+    shutdown already begun and is refused exactly like a handler arriving
+    after shutdown; it never publishes a client on the stopping server.
+    """
+    caplog.set_level(logging.INFO, logger="CompanionFrameServer")
+    server = _queued_server()
+
+    # An attached client whose eviction stalls inside the next handler's
+    # attach section: the stall holds the attach lock deterministically.
+    reader_0, writer_0 = _ScriptedReader(), _GatedWriter()
+    handler_0 = asyncio.create_task(server._handle_client(reader_0, writer_0))
+    await _wait_until(lambda: server._client_writer is writer_0)
+    callbacks_after_attach = server.bridge.add_push_callback.call_count
+
+    reader_a, writer_a = _ScriptedReader(), _RecordingWriter()
+    handler_a = asyncio.create_task(server._handle_client(reader_a, writer_a))
+    # A's attach reached the eviction's wait_closed(): it now holds the lock.
+    await _wait_until(lambda: writer_0.closed)
+
+    # The second handler queues on the attach lock; stop() then queues behind
+    # it — task scheduling is FIFO, so stop() can never overtake this handler.
+    reader_b, writer_b = _ScriptedReader(), _RecordingWriter()
+    handler_b = asyncio.create_task(server._handle_client(reader_b, writer_b))
+    stop_task = asyncio.create_task(server.stop())
+    # stop() retires admission in its first step, before it queues on the lock
+    # the in-flight attach holds.
+    await _wait_until(lambda: server._closing)
+    assert not writer_b.closed  # queued on the lock ahead of stop(), not refused yet
+
+    writer_0.release_wait_closed.set()
+    await stop_task
+    await _wait_until(lambda: handler_a.done() and handler_b.done())
+    await asyncio.gather(handler_a, handler_b)
+
+    assert writer_b.closed and writer_b.written == []
+    assert server._client_writer is None
+    assert server._client_reader is None
+    assert server._write_queue is None
+    assert server._writer_task is None
+    assert server.bridge.add_push_callback.call_count == callbacks_after_attach
+    assert [r for r in caplog.records if "refused during shutdown" in r.getMessage()]
+    connect_records = [
+        r for r in caplog.records if "Companion client connected" in r.getMessage()
+    ]
+    assert len(connect_records) == 1  # only the original client ever attached
+
+    reader_0.close()
+    await _wait_until(lambda: handler_0.done())
+    await asyncio.gather(handler_0)
+
+
+@pytest.mark.asyncio
+async def test_a_handler_mid_attach_when_stop_is_called_does_not_publish_a_client(caplog):
+    """A handler already inside its attach section when stop() runs is refused.
+
+    The attach section awaits the eviction of the current client while holding
+    the attach lock, so shutdown can begin during that await. The section
+    re-checks the closing flag after the await and closes the socket cleanly
+    instead of publishing a client onto the stopping server.
+    """
+    caplog.set_level(logging.INFO, logger="CompanionFrameServer")
+    server = _queued_server()
+
+    reader_0, writer_0 = _ScriptedReader(), _GatedWriter()
+    handler_0 = asyncio.create_task(server._handle_client(reader_0, writer_0))
+    await _wait_until(lambda: server._client_writer is writer_0)
+    callbacks_after_attach = server.bridge.add_push_callback.call_count
+
+    # The next handler is inside its attach section, stalled on the eviction.
+    reader_a, writer_a = _ScriptedReader(), _RecordingWriter()
+    handler_a = asyncio.create_task(server._handle_client(reader_a, writer_a))
+    await _wait_until(lambda: writer_0.closed)
+
+    stop_task = asyncio.create_task(server.stop())
+    # stop() retires admission in its first step, while the attach still holds
+    # the lock inside its eviction await.
+    await _wait_until(lambda: server._closing)
+    writer_0.release_wait_closed.set()
+    await stop_task
+    await _wait_until(lambda: handler_a.done())
+    await asyncio.gather(handler_a)
+
+    assert writer_a.closed and writer_a.written == []
+    assert server._client_writer is None
+    assert server._client_reader is None
+    assert server._write_queue is None
+    assert server._writer_task is None
+    assert server.bridge.add_push_callback.call_count == callbacks_after_attach
+    assert [r for r in caplog.records if "refused during shutdown" in r.getMessage()]
+    connect_records = [
+        r for r in caplog.records if "Companion client connected" in r.getMessage()
+    ]
+    assert len(connect_records) == 1  # only the original client ever attached
+
+    reader_0.close()
+    await _wait_until(lambda: handler_0.done())
+    await asyncio.gather(handler_0)
 
 
 @pytest.mark.asyncio

@@ -66,16 +66,23 @@ class _FrameTransportMixin:
 
     async def stop(self) -> None:
         """Stop the TCP server and disconnect any client."""
-        # Retire admission before awaiting any client cleanup.
+        # Retire admission as the very first action, before any await and
+        # before the listener is touched. asyncio locks are fair, so a handler
+        # that began waiting on the attach lock before this call would
+        # otherwise acquire it ahead of stop() and attach onto a server that
+        # is shutting down. With the flag already set when stop() itself
+        # queues on the lock, every handler that acquires the lock — whether
+        # it queued before or after this call — is refused exactly like a
+        # handler that arrives after shutdown, and a handler already inside
+        # its attach section re-checks the flag after its evicting await.
+        self._closing = True
         if self._server:
             self._server.close()
         # Settle the per-client registration under the attach lock: a handler
         # that acquired the lock just before this call has finished attaching
-        # and is torn down here, and once shutdown has begun no newly accepted
-        # client can attach while this teardown runs (they wait on the lock and
-        # are refused below).
+        # and is torn down here, and admission is already retired, so no
+        # handler can publish a client while this teardown runs.
         async with self._client_attach_lock:
-            self._closing = True
             queue, self._write_queue = self._write_queue, None
             if queue is not None:
                 try:
@@ -376,10 +383,17 @@ class _FrameTransportMixin:
         frees the slot when no data is received for client_idle_timeout_sec.
         """
         async with self._client_attach_lock:
+            if self._client_writer and not self._closing:
+                await self._evict_existing_client()
             if self._closing:
                 # Shutdown has begun: this handler belongs to a connection the
-                # listener accepted before it retired. Close the socket cleanly
-                # instead of starting a client on a server that is going away.
+                # listener accepted before admission was retired — including
+                # handlers that queued on this lock ahead of stop(), and
+                # handlers already inside their attach section when stop() ran
+                # (the eviction above awaits while holding the lock, so the
+                # flag is re-checked here rather than trusted from the entry
+                # check). Close the socket cleanly instead of starting a
+                # client on a server that is going away.
                 logger.info("Companion client refused during shutdown (port=%s)", self.port)
                 writer.close()
                 try:
@@ -387,8 +401,6 @@ class _FrameTransportMixin:
                 except Exception:
                     pass
                 return
-            if self._client_writer:
-                await self._evict_existing_client()
 
             self._client_reader = reader
             self._client_writer = writer
