@@ -51,6 +51,7 @@ def _wire_chain():
     bridge = _TraceBridge()
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=256)
+    server._client_writer = _OpenWriter()
     server._setup_push_callbacks()  # registers _on_trace_received on the bridge
     handler = TraceHandler(lambda _m: None, on_trace_complete=bridge._on_trace_complete)
     return handler, server
@@ -145,3 +146,22 @@ async def test_no_emission_when_hook_unset():
 
     assert result is not None and result["valid"] is True
     assert fired == []
+
+
+class _OpenWriter:
+    """A live attached-transport double for tests that stub the write queue."""
+
+    def write(self, _data):
+        return None
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+    def is_closing(self):
+        return False

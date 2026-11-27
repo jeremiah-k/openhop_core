@@ -19,6 +19,7 @@ from ..constants import (
     MAX_CHANNEL_DATA_LENGTH,
     MAX_GROUP_DATA_LENGTH,
     MAX_PATH_SIZE,
+    MAX_PAYLOAD_SIZE,
     OUT_PATH_UNKNOWN,
     PUB_KEY_SIZE,
     PUSH_CODE_LOGIN_FAIL,
@@ -54,6 +55,21 @@ def _encode_lpp_voltage(channel: int, millivolts: int) -> bytes:
     to stay byte-identical. Unknown battery (0 mV) still emits a 0 V entry.
     """
     return encode_voltage(channel, millivolts / 1000.0)
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> bytes:
+    """Encode ``text`` as UTF-8 and cut it to at most ``max_bytes`` bytes.
+
+    The cut never splits a multi-byte character: a character that would only
+    fit partially is dropped instead of being emitted as a broken sequence, so
+    the result is always valid UTF-8.
+    """
+    if max_bytes <= 0:
+        return b""
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return encoded
+    return encoded[:max_bytes].decode("utf-8", errors="ignore").encode("utf-8")
 
 
 class _MessagingCommandsMixin:
@@ -330,7 +346,15 @@ class _MessagingCommandsMixin:
         self._write_sent_response(result.is_flood, tag, result.timeout_ms)
 
     def _build_message_frame(self, msg: "QueuedMessage") -> bytes:
-        """Encode a QueuedMessage into a response frame (shared by base and subclasses)."""
+        """Encode a QueuedMessage into a response frame (shared by base and subclasses).
+
+        The complete frame must fit ``MAX_PAYLOAD_SIZE`` — the firmware
+        ``writeFrame()`` refuses to write a larger one — so the message text is
+        truncated to the room left after the fixed header.  Only the text is
+        shortened: the header (code, SNR, sender prefix, path length, type,
+        timestamp) and the 4-byte signed-author prefix are always emitted in
+        full.
+        """
         snr_byte = max(-128, min(127, int(round(getattr(msg, "snr", 0) * 4))))
         if snr_byte < 0:
             snr_byte += 256
@@ -355,25 +379,21 @@ class _MessagingCommandsMixin:
                     + payload
                 )
             txt_type = 0
-            text_bytes = (msg.text or "").rstrip("\x00").encode("utf-8", errors="replace")
+            text = (msg.text or "").rstrip("\x00")
             if self._app_target_ver >= 3:
-                return (
-                    bytes(
-                        [
-                            RESP_CODE_CHANNEL_MSG_RECV_V3,
-                            snr_byte & 0xFF,
-                            0,
-                            0,
-                            msg.channel_idx,
-                            path_len_byte,
-                            txt_type,
-                        ]
-                    )
-                    + struct.pack("<I", msg.timestamp)
-                    + text_bytes
+                header = bytes(
+                    [
+                        RESP_CODE_CHANNEL_MSG_RECV_V3,
+                        snr_byte & 0xFF,
+                        0,
+                        0,
+                        msg.channel_idx,
+                        path_len_byte,
+                        txt_type,
+                    ]
                 )
-            return (
-                bytes(
+            else:
+                header = bytes(
                     [
                         RESP_CODE_CHANNEL_MSG_RECV,
                         msg.channel_idx,
@@ -381,14 +401,12 @@ class _MessagingCommandsMixin:
                         txt_type,
                     ]
                 )
-                + struct.pack("<I", msg.timestamp)
-                + text_bytes
-            )
+            header += struct.pack("<I", msg.timestamp)
+            return header + _truncate_utf8(text, MAX_PAYLOAD_SIZE - len(header))
         prefix = (
             msg.sender_key[:6] if len(msg.sender_key) >= 6 else msg.sender_key.ljust(6, b"\x00")
         )
         path_len_byte = msg.path_len if msg.path_len < 256 else 0xFF
-        text_bytes = msg.text.encode("utf-8", errors="replace")
         extra = b""
         if msg.txt_type == TXT_TYPE_SIGNED_PLAIN:
             # Firmware queueMessage() inserts the 4-byte author pubkey prefix
@@ -397,30 +415,44 @@ class _MessagingCommandsMixin:
             author = bytes(getattr(msg, "sender_prefix", b"") or b"")
             extra = author[:4].ljust(4, b"\x00")
         if self._app_target_ver >= 3:
-            return (
-                bytes([RESP_CODE_CONTACT_MSG_RECV_V3, snr_byte & 0xFF, 0, 0])
-                + prefix
-                + bytes([path_len_byte, msg.txt_type])
-                + struct.pack("<I", msg.timestamp)
-                + extra
-                + text_bytes
-            )
-        return (
-            bytes([RESP_CODE_CONTACT_MSG_RECV])
-            + prefix
-            + bytes([path_len_byte, msg.txt_type])
-            + struct.pack("<I", msg.timestamp)
-            + extra
-            + text_bytes
-        )
+            header = bytes([RESP_CODE_CONTACT_MSG_RECV_V3, snr_byte & 0xFF, 0, 0]) + prefix
+        else:
+            header = bytes([RESP_CODE_CONTACT_MSG_RECV]) + prefix
+        header += bytes([path_len_byte, msg.txt_type])
+        header += struct.pack("<I", msg.timestamp)
+        header += extra
+        return header + _truncate_utf8(msg.text, MAX_PAYLOAD_SIZE - len(header))
 
-    async def _cmd_sync_next_message(self, data: bytes) -> None:
+    def _sync_memory_message(self) -> bool:
+        """Handle one memory entry; False means only that the queue was empty.
+
+        No await separates pop, frame admission and rollback. A failed enqueue
+        restores the original FIFO head without evicting another message.
+        """
         msg = self.bridge.sync_next_message()
         if msg is None:
-            msg = await asyncio.to_thread(self._sync_next_from_persistence)
-        if msg is None:
+            return False
+        accepted = False
+        try:
+            accepted = self._write_frame(self._build_message_frame(msg))
+            if accepted:
+                msg.frame_enqueued = True
+        finally:
+            if not accepted:
+                self.bridge.message_queue.restore_front(msg)
+        return True
+
+    async def _cmd_sync_next_message(self, data: bytes) -> None:
+        if self._sync_memory_message():
+            return
+        queue = self._write_queue
+        persisted = await asyncio.to_thread(self._sync_next_from_persistence)
+        if self._write_queue is not queue:
+            return
+        if persisted is None:
             self._write_frame(bytes([RESP_CODE_NO_MORE_MESSAGES]))
             return
+        msg = persisted[1] if isinstance(persisted, tuple) else persisted
         self._write_frame(self._build_message_frame(msg))
 
     async def _cmd_send_login(self, data: bytes) -> None:

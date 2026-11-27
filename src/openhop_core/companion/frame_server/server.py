@@ -13,7 +13,7 @@ Frame format:
 
 import asyncio
 import logging
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple, Union
 
 from ..constants import (
     ADV_TYPE_NONE,
@@ -143,6 +143,11 @@ class CompanionFrameServer(
         self._client_reader: Optional[asyncio.StreamReader] = None
         self._write_queue: Optional[asyncio.Queue] = None
         self._writer_task: Optional[asyncio.Task] = None
+        self._client_attach_lock = asyncio.Lock()
+        # Set by stop() before it touches the listener or waits for the attach
+        # lock: once shutdown has begun, no client may start a handler on the
+        # closing server.
+        self._closing = False
         self._app_target_ver = 0
 
         # Pre-compute padded device info bytes for _cmd_device_query. Version string
@@ -224,9 +229,19 @@ class CompanionFrameServer(
         ``queue_entry`` is the exact in-memory queue entry this message came from,
         so an overriding persistence layer can remove it by identity."""
 
-    def _sync_next_from_persistence(self) -> Optional[QueuedMessage]:
-        """Hook: pop a persisted message when the bridge queue is empty.
-        Default returns ``None``."""
+    def _sync_next_from_persistence(
+        self,
+    ) -> Optional[Union[QueuedMessage, Tuple[int, QueuedMessage]]]:
+        """Hook: fetch a persisted message when the bridge queue is empty.
+
+        Default returns ``None``.  A durable store may return a
+        ``(row_id, message)`` tuple instead of a bare message: the row id lets
+        the store delete exactly that row once the frame has been queued for
+        the client.  Such a store also overrides :meth:`_cmd_sync_next_message`
+        to delete the row after a successful enqueue (the repeater's SQLite
+        queue does this), so a frame that could not be queued leaves the
+        message in place for a later attempt.
+        """
         return None
 
     async def _maybe_persist_contact(self, contact) -> None:

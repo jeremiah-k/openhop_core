@@ -23,11 +23,26 @@ class MessageQueue:
         # silently discard the oldest message even when it is a direct one.
         self._queue: deque[QueuedMessage] = deque()
         self._max_size = max_size
+        # Admission counter: every accepted message is stamped here, at push
+        # time on the queue's single event-loop writer, so the number order is
+        # the arrival order no matter when (or whether) a persistence layer
+        # later stores the message. Never read from a store in ``push``.
+        self._next_arrival_seq = 1
 
     @property
     def max_size(self) -> int:
         """Maximum number of messages retained (zero disables storage)."""
         return self._max_size
+
+    def seed_arrival_counter(self, last_arrival_seq: int) -> None:
+        """Raise the counter above arrival numbers already durable elsewhere.
+
+        A host whose persisted rows carry admission numbers (the repeater's
+        SQLite companion queue) calls this once at startup with the highest
+        stored number, so entries admitted from now on sort behind that
+        stored backlog. Never lowers the counter.
+        """
+        self._next_arrival_seq = max(self._next_arrival_seq, int(last_arrival_seq) + 1)
 
     def push(self, msg: QueuedMessage) -> bool:
         """Add a message to the queue using MeshCore's protected eviction rule.
@@ -35,6 +50,9 @@ class MessageQueue:
         At capacity, remove the oldest channel message and append ``msg``. If
         every retained message is direct, retain them all and reject ``msg``.
         Returns whether ``msg`` was queued.
+
+        An admitted message is stamped with the next admission number
+        (``arrival_seq``); a rejected message consumes no number.
         """
         if self._max_size <= 0:
             return False
@@ -45,20 +63,22 @@ class MessageQueue:
                     break
             else:
                 return False
+        msg.arrival_seq = self._next_arrival_seq
+        self._next_arrival_seq += 1
         self._queue.append(msg)
         return True
 
     def pop(self) -> Optional[QueuedMessage]:
         """Remove and return the oldest message, or None if empty."""
-        if self._queue:
-            return self._queue.popleft()
-        return None
+        return self._queue.popleft() if self._queue else None
 
     def pop_last(self) -> Optional[QueuedMessage]:
         """Remove and return the most recently pushed message, or None if empty."""
-        if self._queue:
-            return self._queue.pop()
-        return None
+        return self._queue.pop() if self._queue else None
+
+    def restore_front(self, msg: QueuedMessage) -> None:
+        """Undo a pop in the same event-loop turn, without eviction or reordering."""
+        self._queue.appendleft(msg)
 
     def remove(self, msg: QueuedMessage) -> bool:
         """Remove a specific entry from the queue by identity (``is``).

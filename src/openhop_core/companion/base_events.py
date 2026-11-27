@@ -143,6 +143,7 @@ class _RxEventsMixin:
                 path_len=path_len,
                 queued=was_queued,
                 queue_entry=msg if was_queued else None,
+                arrival_seq=msg.arrival_seq if was_queued else None,
             ),
         )
 
@@ -201,6 +202,7 @@ class _RxEventsMixin:
                 rssi=rssi,
                 queued=was_queued,
                 queue_entry=msg if was_queued else None,
+                arrival_seq=msg.arrival_seq if was_queued else None,
             ),
         )
 
@@ -288,5 +290,6 @@ class _RxEventsMixin:
                 rssi=rssi,
                 queued=was_queued,
                 queue_entry=queued_message if was_queued else None,
+                arrival_seq=queued_message.arrival_seq if was_queued else None,
             ),
         )

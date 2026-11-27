@@ -212,6 +212,15 @@ class QueuedMessage:
     # 4-byte author pubkey prefix for TXT_TYPE_SIGNED_PLAIN (room server posts);
     # emitted between timestamp and text in the CONTACT_MSG_RECV frame.
     sender_prefix: bytes = b""
+    # Set only by a frame server after accepting this message into its
+    # outbound queue. Neither dequeue nor eviction is a client receipt.
+    frame_enqueued: bool = False
+    # Arrival number assigned by the offline queue at admission
+    # (``MessageQueue.push``): one monotonically increasing number per
+    # accepted message, so the number order is the arrival order regardless
+    # of when a persistence layer later stores the message. None only for
+    # entries built outside a queue.
+    arrival_seq: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -239,6 +248,9 @@ class MessageEvent:
     # persistence layer can remove that entry by identity instead of guessing.
     # None when the protected queue rejected the push.
     queue_entry: Optional[QueuedMessage] = None
+    # The entry's admission number (see ``QueuedMessage.arrival_seq``); None
+    # when the event did not come from the queue.
+    arrival_seq: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -259,6 +271,9 @@ class ChannelMessageEvent:
     # persistence layer can remove that entry by identity instead of guessing.
     # None when the protected queue rejected the push.
     queue_entry: Optional[QueuedMessage] = None
+    # The entry's admission number (see ``QueuedMessage.arrival_seq``); None
+    # when the event did not come from the queue.
+    arrival_seq: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -277,3 +292,6 @@ class ChannelDataEvent:
     # persistence layer can remove that entry by identity instead of guessing.
     # None when the protected queue rejected the push.
     queue_entry: Optional[QueuedMessage] = None
+    # The entry's admission number (see ``QueuedMessage.arrival_seq``); None
+    # when the event did not come from the queue.
+    arrival_seq: Optional[int] = None
