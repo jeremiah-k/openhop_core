@@ -109,6 +109,26 @@ def _server_with_queue() -> tuple[CompanionFrameServer, MessageQueue, QueuedMess
     return server, queue, entry
 
 
+def _track_sync_dispatches(server: CompanionFrameServer) -> list:
+    """Record completed CMD_SYNC_NEXT_MESSAGE dispatches on the server.
+
+    A frame counts as handled once its command handler returned, so waiting on
+    the returned list proves the frame was dispatched to the transport and the
+    admission path saw it — including the refusal a dead writer must produce.
+    """
+    original = server._cmd_handlers[CMD_SYNC_NEXT_MESSAGE]
+    dispatches: list = []
+
+    async def tracked(data):
+        try:
+            await original(data)
+        finally:
+            dispatches.append(True)
+
+    server._cmd_handlers[CMD_SYNC_NEXT_MESSAGE] = tracked
+    return dispatches
+
+
 @pytest.mark.asyncio
 async def test_sync_refuses_a_dead_transport_and_the_successor_gets_the_message():
     """The mid-drain kill shape: socket dead, disconnect unprocessed, sync runs.
@@ -119,6 +139,7 @@ async def test_sync_refuses_a_dead_transport_and_the_successor_gets_the_message(
     and a successor client must still receive it.
     """
     server, queue, entry = _server_with_queue()
+    sync_dispatches = _track_sync_dispatches(server)
 
     reader_a, writer_a = _ScriptedReader(), _RecordingWriter()
     handler_a = asyncio.create_task(server._handle_client(reader_a, writer_a))
@@ -131,11 +152,9 @@ async def test_sync_refuses_a_dead_transport_and_the_successor_gets_the_message(
     assert server._client_writer is writer_a and server._write_queue is not None
 
     # A queued GET_MSG that was already in flight is dispatched into the
-    # dead transport.
+    # dead transport; wait until its handler has actually run.
     reader_a.feed(_command_frame(bytes([CMD_SYNC_NEXT_MESSAGE])))
-    await _wait_until(lambda: bool(writer_a.written) or queue.count == 0 or True)
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
+    await _wait_until(lambda: len(sync_dispatches) == 1)
 
     # Nothing may be claimed for the dying client.
     assert queue.peek() is entry and queue.count == 1
@@ -166,6 +185,7 @@ async def test_sync_does_not_stream_into_a_closing_transport_between_frames():
     refuse to admit, leaving the remaining messages for a successor client.
     """
     server, queue, _first = _server_with_queue()
+    sync_dispatches = _track_sync_dispatches(server)
     second = QueuedMessage(sender_key=b"j" * 32, text="second text")
     queue.push(second)
 
@@ -173,16 +193,16 @@ async def test_sync_does_not_stream_into_a_closing_transport_between_frames():
     handler_a = asyncio.create_task(server._handle_client(reader_a, writer_a))
     await _wait_until(lambda: server._client_writer is writer_a)
 
+    # The first sync drains one message and admits it into the live transport.
     reader_a.feed(_command_frame(bytes([CMD_SYNC_NEXT_MESSAGE])))
-    await _wait_until(lambda: queue.count == 1)
-    await asyncio.sleep(0)
+    await _wait_until(lambda: len(sync_dispatches) == 1)
+    assert queue.count == 1
 
     # The socket dies between two fetches; the client had already queued one
-    # more GET_MSG before it died.
+    # more GET_MSG before it died. Wait until that sync's handler has run.
     writer_a.closed = True
     reader_a.feed(_command_frame(bytes([CMD_SYNC_NEXT_MESSAGE])))
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
+    await _wait_until(lambda: len(sync_dispatches) == 2)
 
     assert queue.count == 1
     assert queue.peek() is second
